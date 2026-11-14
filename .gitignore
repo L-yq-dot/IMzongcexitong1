@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+.web-deps/
+.demo/
+.env
+*.pyc
+*.log
+~$*
+数据库大作业*.docx
