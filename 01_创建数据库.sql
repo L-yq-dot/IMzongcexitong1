@@ -10,6 +10,14 @@
 --   academic_year / assessment_project 删除冗余 UNIQUE 复合键（原仅为复合外键提供索引）
 --   新增 application_item 触发器，替代原复合外键对"条目项目与表单学年规则一致"的声明式约束
 --   等级 grade 与加权分 weighted_score 改为在视图/存储过程中按规则实时计算
+-- 设计优化 v2（2026-11-16）：
+--   student_year_assessment 删除 status 列（与 application_form.status 双份冗余状态，
+--     相应同步 UPDATE 一并移除，申报状态一律以 application_form 为准）
+--   student / reviewer 新增跨表登录名互斥触发器（防止同一数据库账号既申报又审核）
+--   review_item 终审核定分增加 score_cap 封顶校验（不再由 publish 静默截断）
+--   withdraw_item 同时将条目证明材料置为 inactive（避免撤回后材料滞留）
+--   privacy_access_log 增加 (reviewer_id, accessed_at) 审计索引
+--   assessment_rule 增加 parent_rule_id 自引用外键（规则版本链追溯）
 CREATE DATABASE student_assessment CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE student_assessment;
 
@@ -36,9 +44,11 @@ CREATE TABLE assessment_rule (
     excellent_min DECIMAL(5,2) NOT NULL DEFAULT 90,
     good_min DECIMAL(5,2) NOT NULL DEFAULT 80,
     pass_min DECIMAL(5,2) NOT NULL DEFAULT 60,
+    parent_rule_id INT UNSIGNED NULL COMMENT '上一版本规则，NULL 表示该规则的第一个版本',
     UNIQUE (rule_name, version_no),
     CHECK (excellent_min <= 100 AND excellent_min > good_min
-           AND good_min > pass_min AND pass_min >= 0)
+           AND good_min > pass_min AND pass_min >= 0),
+    FOREIGN KEY (parent_rule_id) REFERENCES assessment_rule(rule_id)
 ) COMMENT='测评规则';
 
 CREATE TABLE academic_year (
@@ -73,14 +83,13 @@ CREATE TABLE student_year_assessment (
     student_id VARCHAR(24) NOT NULL,
     year_id VARCHAR(24) NOT NULL,
     class_id VARCHAR(24) NOT NULL COMMENT '建档时的班级快照',
-    status ENUM('draft','submitted','completed') NOT NULL DEFAULT 'draft',
     created_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
     PRIMARY KEY (student_id, year_id),
     KEY (year_id, class_id),
     FOREIGN KEY (student_id) REFERENCES student(student_id),
     FOREIGN KEY (year_id) REFERENCES academic_year(year_id),
     FOREIGN KEY (class_id) REFERENCES class_group(class_id)
-) COMMENT='学生学年测评';
+) COMMENT='学生学年测评（建档锚点与班级快照；申报状态一律见 application_form）';
 
 CREATE TABLE application_form (
     form_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -188,6 +197,7 @@ CREATE TABLE privacy_access_log (
     item_id BIGINT UNSIGNED NOT NULL,
     evidence_id BIGINT UNSIGNED NULL,
     accessed_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    KEY (reviewer_id, accessed_at),
     FOREIGN KEY (reviewer_id) REFERENCES reviewer(reviewer_id),
     FOREIGN KEY (item_id) REFERENCES application_item(item_id),
     FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id)
@@ -270,8 +280,6 @@ BEGIN
     UPDATE application_item SET status = 'draft', final_score = NULL
     WHERE form_id = v_form AND status <> 'withdrawn';
     UPDATE application_form SET status = 'draft', modified_at = UTC_TIMESTAMP(6) WHERE form_id = v_form;
-    UPDATE student_year_assessment SET status = 'draft'
-    WHERE student_id = v_student AND year_id = p_year;
     COMMIT;
 END$$
 
@@ -335,6 +343,7 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只能移除本人草稿内的条目';
     END IF;
     UPDATE application_item SET status = 'withdrawn' WHERE item_id = p_item;
+    UPDATE evidence SET active = FALSE WHERE item_id = p_item;
     UPDATE application_form SET modified_at = UTC_TIMESTAMP(6) WHERE form_id = v_form;
     COMMIT;
 END$$
@@ -415,8 +424,6 @@ BEGIN
     UPDATE application_form SET status = 'submitted', round_no = round_no + 1,
         submitted_at = UTC_TIMESTAMP(6), modified_at = UTC_TIMESTAMP(6)
     WHERE form_id = v_form;
-    UPDATE student_year_assessment SET status = 'submitted'
-    WHERE student_id = v_student AND year_id = p_year;
     COMMIT;
 END$$
 
@@ -460,6 +467,7 @@ BEGIN
     DECLARE v_stage, v_year_status VARCHAR(16);
     DECLARE v_item_status VARCHAR(24);
     DECLARE v_claim DECIMAL(10,2);
+    DECLARE v_cap DECIMAL(10,2);
     DECLARE v_evidence_ids JSON;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
@@ -473,9 +481,15 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '请选择通过或驳回，驳回须填写意见';
     END IF;
     SELECT claimed_score INTO v_claim FROM application_item WHERE item_id = p_item;
+    SELECT p.score_cap INTO v_cap
+    FROM application_item i JOIN assessment_project p USING (project_id)
+    WHERE i.item_id = p_item;
     IF v_stage = 'final' AND p_decision = 'pass' THEN
         IF p_final_score IS NULL OR p_final_score < 0 OR p_final_score > v_claim THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '终审核定分须介于零与申报分之间';
+        END IF;
+        IF p_final_score > v_cap THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '终审核定分不能超过项目封顶分';
         END IF;
     ELSEIF p_final_score IS NOT NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只有终审通过时填写核定分';
@@ -648,8 +662,6 @@ BEGIN
     FROM calculation_input c JOIN assessment_result r USING (student_id, year_id)
     WHERE c.year_id = p_year;
     UPDATE application_form SET status = 'completed' WHERE year_id = p_year AND status = 'submitted';
-    UPDATE student_year_assessment SET status = 'completed'
-    WHERE year_id = p_year AND status = 'submitted';
     UPDATE academic_year SET status = 'published', published_at = v_batch WHERE year_id = p_year;
     COMMIT;
 END$$
@@ -746,6 +758,40 @@ BEGIN
     END IF;
     IF OLD.status <> 'draft' AND NEW.status = 'draft' THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '已启用学年不能退回草稿';
+    END IF;
+END$$
+
+-- 学生与审核人的登录名互斥：同一数据库账号不能同时绑定两种身份，
+-- 防止一人既申报又审核（甚至审核自己）。MySQL 无跨表 UNIQUE/断言，故用触发器。
+CREATE TRIGGER student_login_not_reviewer_ins BEFORE INSERT ON student FOR EACH ROW
+BEGIN
+    IF EXISTS (SELECT 1 FROM reviewer WHERE login_name = NEW.login_name) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该登录名已绑定审核人员';
+    END IF;
+END$$
+
+CREATE TRIGGER student_login_not_reviewer_upd BEFORE UPDATE ON student FOR EACH ROW
+BEGIN
+    IF NEW.login_name <> OLD.login_name AND EXISTS (
+        SELECT 1 FROM reviewer WHERE login_name = NEW.login_name
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该登录名已绑定审核人员';
+    END IF;
+END$$
+
+CREATE TRIGGER reviewer_login_not_student_ins BEFORE INSERT ON reviewer FOR EACH ROW
+BEGIN
+    IF EXISTS (SELECT 1 FROM student WHERE login_name = NEW.login_name) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该登录名已绑定学生';
+    END IF;
+END$$
+
+CREATE TRIGGER reviewer_login_not_student_upd BEFORE UPDATE ON reviewer FOR EACH ROW
+BEGIN
+    IF NEW.login_name <> OLD.login_name AND EXISTS (
+        SELECT 1 FROM student WHERE login_name = NEW.login_name
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该登录名已绑定学生';
     END IF;
 END$$
 
