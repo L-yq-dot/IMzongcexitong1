@@ -18,6 +18,13 @@
 --   withdraw_item 同时将条目证明材料置为 inactive（避免撤回后材料滞留）
 --   privacy_access_log 增加 (reviewer_id, accessed_at) 审计索引
 --   assessment_rule 增加 parent_rule_id 自引用外键（规则版本链追溯）
+-- 特色功能 v3（2026-11-16）：
+--   新增过程 review_item_diff：驳回重提对比，把最近一次驳回快照与当前条目并排输出，
+--     字段级标出改动（项目、细节、申报分、发生日期、附件数量），审核人一眼定位改动
+--   新增视图 student_progress（跨学年个人进展，LAG 窗口函数）与聚合视图
+--     class_progress_stats（班级进步统计，不含个人标识），过程 my_progress（学生自查）
+--   新增事件 open_due_years / review_due_years：由 MySQL 事件调度器自动推进学年状态
+--     （到开放时刻自动开启、过截止时刻自动转入审核），应用层不再手工切换
 CREATE DATABASE student_assessment CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE student_assessment;
 
@@ -561,6 +568,55 @@ BEGIN
     COMMIT;
 END$$
 
+-- 驳回重提对比：把最近一次驳回时审核人看到的申报快照与学生修改后的当前条目
+-- 并排返回，字段级标出是否变化，审核人无需重读全文即可定位改动。
+CREATE PROCEDURE review_item_diff(IN p_item BIGINT UNSIGNED)
+BEGIN
+    DECLARE v_reviewer, v_round INT UNSIGNED;
+    DECLARE v_stage, v_year_status VARCHAR(16);
+    DECLARE v_item_status VARCHAR(24);
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+    SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+    START TRANSACTION;
+    CALL lock_review_item(p_item, v_reviewer, v_stage, v_item_status, v_round, v_year_status);
+    INSERT INTO privacy_access_log(reviewer_id, item_id) VALUES(v_reviewer, p_item);
+    SELECT
+        rr.review_id, rr.round_no, rr.reviewed_at, rr.opinion,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.project_id') AS UNSIGNED) AS project_then,
+        i.project_id AS project_now,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.project_id') AS UNSIGNED) <> i.project_id AS project_changed,
+        JSON_UNQUOTE(JSON_EXTRACT(rr.reviewed_item, '$.details')) AS details_then,
+        i.details AS details_now,
+        JSON_UNQUOTE(JSON_EXTRACT(rr.reviewed_item, '$.details')) <> i.details AS details_changed,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.claimed_score') AS DECIMAL(10,2)) AS claimed_then,
+        i.claimed_score AS claimed_now,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.claimed_score') AS DECIMAL(10,2)) <> i.claimed_score AS claimed_changed,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.occurred_on') AS CHAR) AS occurred_then,
+        CAST(i.occurred_on AS CHAR) AS occurred_now,
+        CAST(JSON_EXTRACT(rr.reviewed_item, '$.occurred_on') AS CHAR) <> CAST(i.occurred_on AS CHAR) AS occurred_changed,
+        JSON_LENGTH(rr.reviewed_item->'$.evidence_ids') AS evidence_count_then,
+        (SELECT COUNT(*) FROM evidence e WHERE e.item_id = i.item_id AND e.active) AS evidence_count_now,
+        rr.reviewed_item AS snapshot_json
+    FROM review_record rr
+    JOIN application_item i ON i.item_id = rr.item_id
+    WHERE rr.item_id = p_item AND rr.decision = 'return'
+    ORDER BY rr.review_id DESC
+    LIMIT 1;
+    COMMIT;
+END$$
+
+-- 学生自查本人在各学年的成绩、排名及与上一学年的变化。
+CREATE PROCEDURE my_progress()
+READS SQL DATA
+BEGIN
+    SELECT p.year_id, p.year_name, p.total_score, p.rank_no, p.grade,
+           p.prev_year_id, p.prev_total_score, p.prev_rank_no,
+           p.score_delta, p.rank_improvement
+    FROM student s JOIN student_progress p USING (student_id)
+    WHERE s.login_name = SUBSTRING_INDEX(USER(), '@', 1)
+    ORDER BY p.starts_on;
+END$$
+
 CREATE PROCEDURE review_queue(IN p_year VARCHAR(24), IN p_filter VARCHAR(16))
 READS SQL DATA
 BEGIN
@@ -725,11 +781,44 @@ JOIN assessment_project p USING (project_id)
 WHERE f.status IN ('submitted','completed') AND i.status <> 'withdrawn'
 GROUP BY f.year_id, p.project_id, p.project_name;
 
+-- 跨学年个人进展：用 LAG 窗口函数取学生上一次参加测评的学年、总分与名次，
+-- 计算分数变化（score_delta）与名次进步（rank_improvement，正数表示名次上升）。
+-- 含个人标识，仅作内部视图（SQL SECURITY DEFINER），不直接授予任何角色。
+CREATE VIEW student_progress AS
+SELECT r.student_id, r.year_id, y.year_name, y.starts_on, a.class_id,
+       r.total_score, r.rank_no,
+       CASE WHEN r.total_score >= ar.excellent_min THEN '优秀'
+            WHEN r.total_score >= ar.good_min THEN '良好'
+            WHEN r.total_score >= ar.pass_min THEN '合格'
+            ELSE '不合格' END AS grade,
+       LAG(r.year_id) OVER w AS prev_year_id,
+       LAG(r.total_score) OVER w AS prev_total_score,
+       LAG(r.rank_no) OVER w AS prev_rank_no,
+       ROUND(r.total_score - LAG(r.total_score) OVER w, 2) AS score_delta,
+       CAST(LAG(r.rank_no) OVER w AS SIGNED) - CAST(r.rank_no AS SIGNED) AS rank_improvement
+FROM assessment_result r
+JOIN academic_year y USING (year_id)
+JOIN assessment_rule ar ON ar.rule_id = y.rule_id
+JOIN student_year_assessment a ON a.student_id = r.student_id AND a.year_id = r.year_id
+WINDOW w AS (PARTITION BY r.student_id ORDER BY y.starts_on);
+
+-- 班级层面的跨学年进步统计（仅聚合值，不含个人标识），供统计分析员使用。
+CREATE VIEW class_progress_stats AS
+SELECT year_id, year_name, class_id, COUNT(*) AS student_count,
+       SUM(rank_improvement > 0) AS improved_count,
+       SUM(rank_improvement < 0) AS declined_count,
+       SUM(rank_improvement = 0) AS unchanged_count,
+       ROUND(AVG(score_delta), 2) AS avg_score_delta
+FROM student_progress
+WHERE prev_year_id IS NOT NULL
+GROUP BY year_id, year_name, class_id;
+
 CREATE ROLE IF NOT EXISTS 'sa_student', 'sa_reviewer', 'sa_analyst', 'sa_publisher';
 GRANT SELECT ON student_assessment.available_projects TO 'sa_student', 'sa_reviewer';
 GRANT SELECT ON student_assessment.published_results TO 'sa_analyst';
 GRANT SELECT ON student_assessment.class_result_distribution TO 'sa_analyst';
 GRANT SELECT ON student_assessment.project_submission_statistics TO 'sa_analyst';
+GRANT SELECT ON student_assessment.class_progress_stats TO 'sa_analyst';
 GRANT EXECUTE ON PROCEDURE student_assessment.save_form TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.reopen_form TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.save_item TO 'sa_student';
@@ -739,10 +828,12 @@ GRANT EXECUTE ON PROCEDURE student_assessment.remove_evidence TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.submit_form TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.my_form_status TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.my_result TO 'sa_student';
+GRANT EXECUTE ON PROCEDURE student_assessment.my_progress TO 'sa_student';
 GRANT EXECUTE ON PROCEDURE student_assessment.review_queue TO 'sa_reviewer';
 GRANT EXECUTE ON PROCEDURE student_assessment.review_item TO 'sa_reviewer';
 GRANT EXECUTE ON PROCEDURE student_assessment.read_review_item TO 'sa_reviewer';
 GRANT EXECUTE ON PROCEDURE student_assessment.read_evidence TO 'sa_reviewer';
+GRANT EXECUTE ON PROCEDURE student_assessment.review_item_diff TO 'sa_reviewer';
 GRANT EXECUTE ON PROCEDURE student_assessment.publish_year TO 'sa_publisher';
 
 
@@ -852,3 +943,19 @@ BEGIN
     CALL require_unused_rule(OLD.rule_id);
 END$$
 DELIMITER ;
+
+-- 学年状态自动推进（事件调度器）：到开放时刻自动开启，过截止时刻自动转入审核，
+-- 状态机由数据库自己推进，应用层与人工只需负责建学年与公示两个端点。
+-- 事件调度器默认关闭，此处开启需 SYSTEM_VARIABLES_ADMIN 权限（安装账号具备）。
+-- 若事件被关闭，学年不会自动切换，可用 03_网页接口.sql 的 web_close_submissions 手工兜底。
+SET GLOBAL event_scheduler = ON;
+
+CREATE EVENT open_due_years
+ON SCHEDULE EVERY 1 MINUTE
+DO UPDATE academic_year SET status = 'open'
+   WHERE status = 'draft' AND UTC_TIMESTAMP() >= opens_at;
+
+CREATE EVENT review_due_years
+ON SCHEDULE EVERY 1 MINUTE
+DO UPDATE academic_year SET status = 'review'
+   WHERE status = 'open' AND UTC_TIMESTAMP() >= deadline_at;
