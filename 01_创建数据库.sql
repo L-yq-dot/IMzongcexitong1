@@ -1,4 +1,15 @@
 -- MySQL 8.4 · 学生综合测评数据库 · 在新库中执行
+-- 3NF 优化版：删除为"复合外键钉住 rule_id"引入的冗余属性，全部表至少满足 3NF
+-- 与原版的差异：
+--   application_form  删除 rule_id（year_id → rule_id 违反 2NF）
+--   application_item  删除 rule_id（form_id/project_id → rule_id 传递依赖违反 3NF）
+--   assessment_result 删除 rule_id（2NF）、grade（(rule_id,total_score) → grade 违反 3NF）
+--   project_score     删除 rule_id（2NF）、weighted_score（(project_id,approved_score) → weighted_score 违反 3NF）
+--   privacy_access_log 删除 login_account（reviewer_id → login_account 违反 3NF）
+--   evidence.sha256  STORED → VIRTUAL（file_body → sha256 为派生冗余，不再落盘）
+--   academic_year / assessment_project 删除冗余 UNIQUE 复合键（原仅为复合外键提供索引）
+--   新增 application_item 触发器，替代原复合外键对"条目项目与表单学年规则一致"的声明式约束
+--   等级 grade 与加权分 weighted_score 改为在视图/存储过程中按规则实时计算
 CREATE DATABASE student_assessment CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE student_assessment;
 
@@ -41,7 +52,6 @@ CREATE TABLE academic_year (
     rule_id INT UNSIGNED NOT NULL,
     published_at DATETIME(6) NULL COMMENT 'UTC',
     CHECK (starts_on <= ends_on AND opens_at < deadline_at),
-    UNIQUE (year_id, rule_id),
     FOREIGN KEY (rule_id) REFERENCES assessment_rule(rule_id)
 ) COMMENT='学年';
 
@@ -55,7 +65,6 @@ CREATE TABLE assessment_project (
     evidence_required BOOLEAN NOT NULL DEFAULT FALSE,
     evidence_requirement VARCHAR(255) NULL,
     CHECK (weight > 0 AND weight <= 1 AND score_cap > 0 AND evidence_required IN (0,1)),
-    UNIQUE (rule_id, project_id),
     UNIQUE (rule_id, project_name),
     FOREIGN KEY (rule_id) REFERENCES assessment_rule(rule_id)
 ) COMMENT='测评项目';
@@ -77,22 +86,19 @@ CREATE TABLE application_form (
     form_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     student_id VARCHAR(24) NOT NULL,
     year_id VARCHAR(24) NOT NULL,
-    rule_id INT UNSIGNED NOT NULL,
     notes TEXT NULL,
     submitted_at DATETIME(6) NULL,
     status ENUM('draft','submitted','completed') NOT NULL DEFAULT 'draft',
     modified_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
     round_no INT UNSIGNED NOT NULL DEFAULT 0,
     UNIQUE (student_id, year_id),
-    UNIQUE (form_id, rule_id),
     FOREIGN KEY (student_id, year_id) REFERENCES student_year_assessment(student_id, year_id),
-    FOREIGN KEY (year_id, rule_id) REFERENCES academic_year(year_id, rule_id)
+    FOREIGN KEY (year_id) REFERENCES academic_year(year_id)
 ) COMMENT='填报表';
 
 CREATE TABLE application_item (
     item_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     form_id BIGINT UNSIGNED NOT NULL,
-    rule_id INT UNSIGNED NOT NULL,
     project_id INT UNSIGNED NOT NULL,
     details TEXT NOT NULL,
     claimed_score DECIMAL(10,2) NOT NULL,
@@ -103,8 +109,8 @@ CREATE TABLE application_item (
     CHECK (claimed_score >= 0 AND (final_score IS NULL OR final_score >= 0)),
     KEY (form_id, status),
     KEY (project_id, status),
-    FOREIGN KEY (form_id, rule_id) REFERENCES application_form(form_id, rule_id),
-    FOREIGN KEY (rule_id, project_id) REFERENCES assessment_project(rule_id, project_id)
+    FOREIGN KEY (form_id) REFERENCES application_form(form_id),
+    FOREIGN KEY (project_id) REFERENCES assessment_project(project_id)
 ) COMMENT='填报内容';
 
 CREATE TABLE evidence (
@@ -113,7 +119,7 @@ CREATE TABLE evidence (
     file_name VARCHAR(255) NOT NULL,
     storage_location VARCHAR(120) NOT NULL UNIQUE COMMENT '库内对象标识',
     file_body MEDIUMBLOB NOT NULL,
-    sha256 CHAR(64) CHARACTER SET ascii GENERATED ALWAYS AS (SHA2(file_body, 256)) STORED,
+    sha256 CHAR(64) CHARACTER SET ascii GENERATED ALWAYS AS (SHA2(file_body, 256)) VIRTUAL,
     uploaded_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
     active BOOLEAN NOT NULL DEFAULT TRUE,
     CHECK (OCTET_LENGTH(file_body) BETWEEN 1 AND 5242880 AND active IN (0,1)),
@@ -155,31 +161,26 @@ CREATE TABLE assessment_result (
     result_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     student_id VARCHAR(24) NOT NULL,
     year_id VARCHAR(24) NOT NULL,
-    rule_id INT UNSIGNED NOT NULL,
     total_score DECIMAL(5,2) NOT NULL,
-    grade ENUM('优秀','良好','合格','不合格') NOT NULL,
     rank_no INT UNSIGNED NOT NULL,
     generated_at DATETIME(6) NOT NULL,
     UNIQUE (student_id, year_id),
-    UNIQUE (result_id, rule_id),
     KEY (year_id, rank_no),
     CHECK (total_score BETWEEN 0 AND 100 AND rank_no > 0),
     FOREIGN KEY (student_id, year_id) REFERENCES student_year_assessment(student_id, year_id),
-    FOREIGN KEY (year_id, rule_id) REFERENCES academic_year(year_id, rule_id)
-) COMMENT='测评总结果';
+    FOREIGN KEY (year_id) REFERENCES academic_year(year_id)
+) COMMENT='测评总结果（等级 grade 由总分与规则阈值实时计算，见视图）';
 
 CREATE TABLE project_score (
     result_id BIGINT UNSIGNED NOT NULL,
     project_id INT UNSIGNED NOT NULL,
-    rule_id INT UNSIGNED NOT NULL,
     raw_score DECIMAL(18,2) NOT NULL,
     approved_score DECIMAL(10,2) NOT NULL,
-    weighted_score DECIMAL(7,4) NOT NULL,
     PRIMARY KEY (result_id, project_id),
-    CHECK (raw_score >= 0 AND approved_score >= 0 AND weighted_score BETWEEN 0 AND 100),
-    FOREIGN KEY (result_id, rule_id) REFERENCES assessment_result(result_id, rule_id),
-    FOREIGN KEY (rule_id, project_id) REFERENCES assessment_project(rule_id, project_id)
-) COMMENT='项目得分';
+    CHECK (raw_score >= 0 AND approved_score >= 0),
+    FOREIGN KEY (result_id) REFERENCES assessment_result(result_id),
+    FOREIGN KEY (project_id) REFERENCES assessment_project(project_id)
+) COMMENT='项目得分（加权分 weighted_score 查询时按项目权重实时计算）';
 
 CREATE TABLE privacy_access_log (
     access_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -187,7 +188,6 @@ CREATE TABLE privacy_access_log (
     item_id BIGINT UNSIGNED NOT NULL,
     evidence_id BIGINT UNSIGNED NULL,
     accessed_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
-    login_account VARCHAR(288) NOT NULL,
     FOREIGN KEY (reviewer_id) REFERENCES reviewer(reviewer_id),
     FOREIGN KEY (item_id) REFERENCES application_item(item_id),
     FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id)
@@ -242,8 +242,8 @@ BEGIN
     IF v_form IS NULL THEN
         INSERT INTO student_year_assessment(student_id, year_id, class_id)
         SELECT student_id, p_year, class_id FROM student WHERE student_id = v_student;
-        INSERT INTO application_form(student_id, year_id, rule_id, notes)
-        VALUES(v_student, p_year, v_rule, p_notes);
+        INSERT INTO application_form(student_id, year_id, notes)
+        VALUES(v_student, p_year, p_notes);
         SET v_form = LAST_INSERT_ID();
     ELSEIF v_status = 'draft' THEN
         UPDATE application_form SET notes = p_notes, modified_at = UTC_TIMESTAMP(6) WHERE form_id = v_form;
@@ -301,8 +301,8 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '项目不属于本学年规则';
     END IF;
     IF p_item IS NULL THEN
-        INSERT INTO application_item(form_id, rule_id, project_id, details, claimed_score, occurred_on)
-        VALUES(v_form, v_rule, p_project, p_details, p_claim, p_date);
+        INSERT INTO application_item(form_id, project_id, details, claimed_score, occurred_on)
+        VALUES(v_form, p_project, p_details, p_claim, p_date);
         SET v_item = LAST_INSERT_ID();
     ELSE
         IF NOT EXISTS (SELECT 1 FROM application_item
@@ -507,7 +507,7 @@ BEGIN
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     START TRANSACTION;
     CALL lock_review_item(p_item, v_reviewer, v_stage, v_item_status, v_round, v_year_status);
-    INSERT INTO privacy_access_log(reviewer_id, item_id, login_account) VALUES(v_reviewer, p_item, USER());
+    INSERT INTO privacy_access_log(reviewer_id, item_id) VALUES(v_reviewer, p_item);
     SELECT i.item_id, f.year_id, f.student_id, s.student_name, f.notes, p.project_name,
            i.details, i.claimed_score, i.occurred_on, i.status, f.round_no, i.final_score
     FROM application_item i JOIN application_form f USING (form_id)
@@ -542,8 +542,7 @@ BEGIN
     ) THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '无权访问此材料';
     END IF;
-    INSERT INTO privacy_access_log(reviewer_id, item_id, evidence_id, login_account)
-    VALUES(v_reviewer, v_item, p_evidence, USER());
+    INSERT INTO privacy_access_log(reviewer_id, item_id, evidence_id) VALUES(v_reviewer, v_item, p_evidence);
     SELECT evidence_id, file_name, sha256, file_body FROM evidence WHERE evidence_id = p_evidence;
     COMMIT;
 END$$
@@ -589,16 +588,18 @@ END$$
 DELIMITER ;
 
 -- 内部计算视图。每个学生保留规则下的全部项目，缺报项目记零。
+-- 规则版本改由学年表获得（原版直接存于表单，构成 2NF 违例）。
 CREATE VIEW calculation_input AS
-SELECT f.student_id, f.year_id, f.rule_id, p.project_id, p.weight, p.score_cap,
+SELECT f.student_id, f.year_id, y.rule_id, p.project_id, p.weight, p.score_cap,
        COALESCE(SUM(i.claimed_score), 0) AS raw_score,
        LEAST(COALESCE(SUM(i.final_score), 0), p.score_cap) AS approved_score
 FROM application_form f
-JOIN assessment_project p ON p.rule_id = f.rule_id
+JOIN academic_year y ON y.year_id = f.year_id
+JOIN assessment_project p ON p.rule_id = y.rule_id
 LEFT JOIN application_item i ON i.form_id = f.form_id AND i.project_id = p.project_id
                              AND i.status = 'approved'
 WHERE f.status = 'submitted'
-GROUP BY f.student_id, f.year_id, f.rule_id, p.project_id, p.weight, p.score_cap;
+GROUP BY f.student_id, f.year_id, y.rule_id, p.project_id, p.weight, p.score_cap;
 
 DELIMITER $$
 
@@ -632,23 +633,18 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '存在尚未通过终审的已提交表单';
     END IF;
     SET v_batch = UTC_TIMESTAMP(6);
-    INSERT INTO assessment_result(student_id, year_id, rule_id, total_score, grade, rank_no, generated_at)
+    INSERT INTO assessment_result(student_id, year_id, total_score, rank_no, generated_at)
     WITH totals AS (
         SELECT c.student_id, c.year_id, c.rule_id,
                ROUND(SUM(c.approved_score * c.weight * 100 / c.score_cap), 2) AS total_score
         FROM calculation_input c WHERE c.year_id = p_year
         GROUP BY c.student_id, c.year_id, c.rule_id
     )
-    SELECT t.student_id, t.year_id, t.rule_id, t.total_score,
-           CASE WHEN t.total_score >= r.excellent_min THEN '优秀'
-                WHEN t.total_score >= r.good_min THEN '良好'
-                WHEN t.total_score >= r.pass_min THEN '合格'
-                ELSE '不合格' END,
+    SELECT t.student_id, t.year_id, t.total_score,
            RANK() OVER (ORDER BY t.total_score DESC), v_batch
-    FROM totals t JOIN assessment_rule r USING (rule_id);
-    INSERT INTO project_score(result_id, project_id, rule_id, raw_score, approved_score, weighted_score)
-    SELECT r.result_id, c.project_id, c.rule_id, c.raw_score, c.approved_score,
-           ROUND(c.approved_score * c.weight * 100 / c.score_cap, 4)
+    FROM totals t;
+    INSERT INTO project_score(result_id, project_id, raw_score, approved_score)
+    SELECT r.result_id, c.project_id, c.raw_score, c.approved_score
     FROM calculation_input c JOIN assessment_result r USING (student_id, year_id)
     WHERE c.year_id = p_year;
     UPDATE application_form SET status = 'completed' WHERE year_id = p_year AND status = 'submitted';
@@ -661,12 +657,19 @@ END$$
 CREATE PROCEDURE my_result(IN p_year VARCHAR(24))
 READS SQL DATA
 BEGIN
-    SELECT r.result_id, y.year_name, a.class_id, r.total_score, r.grade, r.rank_no, r.generated_at
+    SELECT r.result_id, y.year_name, a.class_id, r.total_score,
+           CASE WHEN r.total_score >= ar.excellent_min THEN '优秀'
+                WHEN r.total_score >= ar.good_min THEN '良好'
+                WHEN r.total_score >= ar.pass_min THEN '合格'
+                ELSE '不合格' END AS grade,
+           r.rank_no, r.generated_at
     FROM student s JOIN assessment_result r USING (student_id)
     JOIN student_year_assessment a ON a.student_id = r.student_id AND a.year_id = r.year_id
     JOIN academic_year y ON y.year_id = r.year_id
+    JOIN assessment_rule ar ON ar.rule_id = y.rule_id
     WHERE s.login_name = SUBSTRING_INDEX(USER(), '@', 1) AND y.year_id = p_year AND y.status = 'published';
-    SELECT p.project_name, ps.raw_score, ps.approved_score, ps.weighted_score
+    SELECT p.project_name, ps.raw_score, ps.approved_score,
+           ROUND(ps.approved_score * p.weight * 100 / p.score_cap, 4) AS weighted_score
     FROM student s JOIN assessment_result r USING (student_id)
     JOIN academic_year y USING (year_id)
     JOIN project_score ps USING (result_id) JOIN assessment_project p USING (project_id)
@@ -684,8 +687,14 @@ FROM academic_year y JOIN assessment_project p USING (rule_id)
 WHERE y.status <> 'draft';
 
 CREATE VIEW published_results AS
-SELECT r.result_id, r.year_id, y.year_name, a.class_id, r.total_score, r.grade, r.rank_no, r.generated_at
+SELECT r.result_id, r.year_id, y.year_name, a.class_id, r.total_score,
+       CASE WHEN r.total_score >= ar.excellent_min THEN '优秀'
+            WHEN r.total_score >= ar.good_min THEN '良好'
+            WHEN r.total_score >= ar.pass_min THEN '合格'
+            ELSE '不合格' END AS grade,
+       r.rank_no, r.generated_at
 FROM assessment_result r JOIN academic_year y USING (year_id)
+JOIN assessment_rule ar ON ar.rule_id = y.rule_id
 JOIN student_year_assessment a ON a.student_id = r.student_id AND a.year_id = r.year_id
 WHERE y.status = 'published';
 
@@ -740,6 +749,32 @@ BEGIN
     END IF;
 END$$
 
+-- 3NF 化后，原复合外键 (form_id, rule_id) 与 (rule_id, project_id) 提供的
+-- "条目项目必须属于表单学年的规则版本"这一跨表约束改由此处触发器保证。
+CREATE TRIGGER check_item_project_rule_ins BEFORE INSERT ON application_item FOR EACH ROW
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM application_form f
+        JOIN academic_year y USING (year_id)
+        JOIN assessment_project p ON p.project_id = NEW.project_id
+        WHERE f.form_id = NEW.form_id AND p.rule_id = y.rule_id
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '项目不属于表单学年的规则';
+    END IF;
+END$$
+
+CREATE TRIGGER check_item_project_rule_upd BEFORE UPDATE ON application_item FOR EACH ROW
+BEGIN
+    IF (NEW.form_id <> OLD.form_id OR NEW.project_id <> OLD.project_id) AND NOT EXISTS (
+        SELECT 1 FROM application_form f
+        JOIN academic_year y USING (year_id)
+        JOIN assessment_project p ON p.project_id = NEW.project_id
+        WHERE f.form_id = NEW.form_id AND p.rule_id = y.rule_id
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '项目不属于表单学年的规则';
+    END IF;
+END$$
+
 CREATE PROCEDURE require_unused_rule(IN p_rule INT UNSIGNED)
 READS SQL DATA
 BEGIN
@@ -771,5 +806,3 @@ BEGIN
     CALL require_unused_rule(OLD.rule_id);
 END$$
 DELIMITER ;
-
-
