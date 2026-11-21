@@ -99,3 +99,13 @@ FROM published_results WHERE year_id = '2025-2026' ORDER BY rank_no, result_id;
 SELECT * FROM class_result_distribution WHERE year_id = '2025-2026' ORDER BY class_id, grade;
 SELECT * FROM project_submission_statistics WHERE year_id = '2025-2026' ORDER BY project_id;
 
+-- v6 新增展示：提交留痕、学生视角公示、管理审计。
+-- 提交记录：甲的表单有两条（首轮 + 驳回重提后的第 2 轮），乙丙各一条。
+SELECT submission_id, form_id, round_no, submitted_at, item_count
+FROM submission_log ORDER BY submission_id;
+-- 学生可见的公示（含姓名学号，仅授权 sa_student / sa_analyst）。
+SELECT student_id, student_name, class_id, total_score, grade, rank_no
+FROM public_notice WHERE year_id = '2025-2026' ORDER BY rank_no, student_id;
+-- 管理审计：主数据录入、学年状态推进与公示操作均留痕（展示最近 8 条）。
+SELECT op_id, operator_login, action, target_id, detail, operated_at
+FROM admin_operation_log ORDER BY op_id DESC LIMIT 8;
