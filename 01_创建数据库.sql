@@ -1,6 +1,6 @@
--- MySQL 8.4 · 学生综合测评数据库 · 在新库中执行
--- 进行了冗余属性的整合，全部表至少满足 3NF
--- 主要做出的修改，v1,范式约束的满足：
+-- MySQL 8.4 · 学生综合测评数据库
+-- 3NF 优化：删除为"复合外键钉住 rule_id"引入的冗余属性，全部表至少满足 3NF
+-- 与原版的差异：
 --   application_form  删除 rule_id（year_id → rule_id 违反 2NF）
 --   application_item  删除 rule_id（form_id/project_id → rule_id 传递依赖违反 3NF）
 --   assessment_result 删除 rule_id（2NF）、grade（(rule_id,total_score) → grade 违反 3NF）
@@ -44,6 +44,14 @@
 --     即 02 演示数据所用的"手工提前关闭申报"快进模式）
 --   student_progress 增加 rule_id/version_no 列，提示跨学年分数差的可比性
 --   排名改用 DENSE_RANK：同分并列且名次连续（1,1,2），避免 RANK 的名次空洞（1,1,3）
+-- 基础问题收尾 v6（2026-11-20）：
+--   完整性：academic_year 防日期区间重叠触发器；assessment_project 权重合计≤1 编辑期校验
+--   审计闭环：access_denied_log（越权尝试失败也留痕，审核过程在回滚后补记，SIGNAL 消息不变）；
+--     admin_operation_log（abandon_form/publish_year 过程内记录 + 6 张主数据表 18 个 AFTER 触发器，
+--     学年状态变更 old→new 全程留痕；EVENT 自动推进时操作者记为事件定义者账号）
+--   运维：event_scheduler 改 SET PERSIST（重启不丢）；admin_stalled_forms 视图定位卡公示的表单
+--   配套（仓库同步目录）：demo.py 增 sa_demo_admin 账号与 --event-scheduler=ON 启动参数；
+--     02 追加新功能展示查询；tests/test_constraints.py 约束负例套件；使用说明.md 全面同步
 CREATE DATABASE student_assessment CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE student_assessment;
 
@@ -241,6 +249,32 @@ CREATE TABLE privacy_access_log (
     FOREIGN KEY (item_id) REFERENCES application_item(item_id),
     FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id)
 ) COMMENT='成功读取申报详情或附件的访问日志';
+
+-- 越权访问尝试日志：失败也留痕。故意不设外键——审计写入绝不能因目标不存在而失败。
+-- 由审核类过程的 EXIT HANDLER 在 ROLLBACK 之后补记（否则日志会随事务一起回滚）。
+CREATE TABLE access_denied_log (
+    denied_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    login_name VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    item_id BIGINT UNSIGNED NULL,
+    evidence_id BIGINT UNSIGNED NULL,
+    reason VARCHAR(100) NOT NULL,
+    denied_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    KEY (login_name, denied_at)
+) COMMENT='越权访问尝试日志';
+
+-- 管理员操作与主数据变更审计：abandon_form/publish_year 过程内记录，
+-- 6 张主数据表的 AFTER INSERT/UPDATE/DELETE 触发器记录数据变更（含学年状态 old→new）。
+-- 故意不设外键，审计写入永不失败；被删除对象的历史记录仍可追溯。
+CREATE TABLE admin_operation_log (
+    op_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    operator_login VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    action VARCHAR(40) NOT NULL,
+    target_id VARCHAR(64) NULL,
+    detail VARCHAR(500) NULL,
+    operated_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    KEY (operator_login, operated_at),
+    KEY (action, operated_at)
+) COMMENT='管理员操作与主数据变更审计';
 
 DELIMITER $$
 
@@ -488,11 +522,13 @@ BEGIN
     DECLARE v_rule INT UNSIGNED;
     DECLARE v_opens, v_deadline DATETIME;
     SET p_reviewer = NULL, v_year = NULL;
+    SET @sa_denial_item = NULL, @sa_denial_evidence = NULL, @sa_denial_reason = NULL;
     SELECT reviewer_id, review_role, class_id INTO p_reviewer, p_stage, v_scope
     FROM reviewer WHERE login_name = SUBSTRING_INDEX(USER(), '@', 1);
     SELECT f.year_id INTO v_year
     FROM application_item i JOIN application_form f USING (form_id) WHERE i.item_id = p_item;
     IF p_reviewer IS NULL OR v_year IS NULL THEN
+        SET @sa_denial_item = p_item, @sa_denial_reason = '账号未绑定审核人或条目不存在';
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '无权访问此申报条目';
     END IF;
     CALL lock_assessment_year(v_year, v_rule, p_year_status, v_opens, v_deadline);
@@ -504,6 +540,7 @@ BEGIN
        OR (p_item_status = 'withdrawn' AND NOT EXISTS (
            SELECT 1 FROM review_record WHERE item_id = p_item
        )) THEN
+        SET @sa_denial_item = p_item, @sa_denial_reason = '班级范围或条目状态不符';
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '无权访问此申报条目';
     END IF;
 END$$
@@ -521,7 +558,16 @@ BEGIN
     DECLARE v_sum DECIMAL(10,2);
     DECLARE v_locked BIGINT UNSIGNED;
     DECLARE v_evidence_ids JSON;
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        IF @sa_denial_reason IS NOT NULL THEN
+            INSERT INTO access_denied_log(login_name, item_id, evidence_id, reason)
+            VALUES (SUBSTRING_INDEX(USER(), '@', 1), @sa_denial_item, @sa_denial_evidence, @sa_denial_reason);
+            SET @sa_denial_item = NULL, @sa_denial_evidence = NULL, @sa_denial_reason = NULL;
+        END IF;
+        RESIGNAL;
+    END;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     START TRANSACTION;
     CALL lock_review_item(p_item, v_reviewer, v_stage, v_item_status, v_round, v_year_status);
@@ -583,7 +629,16 @@ BEGIN
     DECLARE v_reviewer, v_round INT UNSIGNED;
     DECLARE v_stage, v_year_status VARCHAR(16);
     DECLARE v_item_status VARCHAR(24);
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        IF @sa_denial_reason IS NOT NULL THEN
+            INSERT INTO access_denied_log(login_name, item_id, evidence_id, reason)
+            VALUES (SUBSTRING_INDEX(USER(), '@', 1), @sa_denial_item, @sa_denial_evidence, @sa_denial_reason);
+            SET @sa_denial_item = NULL, @sa_denial_evidence = NULL, @sa_denial_reason = NULL;
+        END IF;
+        RESIGNAL;
+    END;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     START TRANSACTION;
     CALL lock_review_item(p_item, v_reviewer, v_stage, v_item_status, v_round, v_year_status);
@@ -609,7 +664,16 @@ BEGIN
     DECLARE v_reviewer, v_round INT UNSIGNED;
     DECLARE v_stage, v_year_status VARCHAR(16);
     DECLARE v_item_status VARCHAR(24);
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        IF @sa_denial_reason IS NOT NULL THEN
+            INSERT INTO access_denied_log(login_name, item_id, evidence_id, reason)
+            VALUES (SUBSTRING_INDEX(USER(), '@', 1), @sa_denial_item, @sa_denial_evidence, @sa_denial_reason);
+            SET @sa_denial_item = NULL, @sa_denial_evidence = NULL, @sa_denial_reason = NULL;
+        END IF;
+        RESIGNAL;
+    END;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     START TRANSACTION;
     SELECT item_id INTO v_item FROM evidence WHERE evidence_id = p_evidence;
@@ -620,6 +684,7 @@ BEGIN
             AND JSON_CONTAINS(r.reviewed_item, CAST(p_evidence AS JSON), '$.evidence_ids')
         ))
     ) THEN
+        SET @sa_denial_item = v_item, @sa_denial_evidence = p_evidence, @sa_denial_reason = '无权访问此材料';
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '无权访问此材料';
     END IF;
     INSERT INTO privacy_access_log(reviewer_id, item_id, evidence_id) VALUES(v_reviewer, v_item, p_evidence);
@@ -634,7 +699,16 @@ BEGIN
     DECLARE v_reviewer, v_round INT UNSIGNED;
     DECLARE v_stage, v_year_status VARCHAR(16);
     DECLARE v_item_status VARCHAR(24);
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        IF @sa_denial_reason IS NOT NULL THEN
+            INSERT INTO access_denied_log(login_name, item_id, evidence_id, reason)
+            VALUES (SUBSTRING_INDEX(USER(), '@', 1), @sa_denial_item, @sa_denial_evidence, @sa_denial_reason);
+            SET @sa_denial_item = NULL, @sa_denial_evidence = NULL, @sa_denial_reason = NULL;
+        END IF;
+        RESIGNAL;
+    END;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     START TRANSACTION;
     CALL lock_review_item(p_item, v_reviewer, v_stage, v_item_status, v_round, v_year_status);
@@ -804,6 +878,8 @@ BEGIN
     WHERE c.year_id = p_year;
     UPDATE application_form SET status = 'completed' WHERE year_id = p_year AND status = 'submitted';
     UPDATE academic_year SET status = 'published', published_at = v_batch WHERE year_id = p_year;
+    INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+    VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'publish_year', p_year, CONCAT('batch=', v_batch));
     COMMIT;
 END$$
 
@@ -839,6 +915,9 @@ BEGIN
     WHERE form_id = v_form AND status NOT IN ('approved','withdrawn');
     UPDATE application_form SET status = 'void', modified_at = UTC_TIMESTAMP(6)
     WHERE form_id = v_form;
+    INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+    VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'abandon_form', p_year,
+            CONCAT('student=', p_student, ', form=', v_form));
     COMMIT;
     SELECT v_form AS form_id, 'void' AS new_status;
 END$$
@@ -904,6 +983,9 @@ JOIN student s ON s.student_id = r.student_id
 JOIN student_year_assessment a ON a.student_id = r.student_id AND a.year_id = r.year_id
 JOIN class_group c ON c.class_id = a.class_id;
 
+-- 隐私口径说明：小班级的 MIN/MAX/AVG 在人数极少时可反推个人分数。
+-- 本视图仅授予受信内部角色 sa_analyst（不对外）；面向学生的公示走 public_notice。
+-- 如需彻底防反推可加 HAVING COUNT(*) >= k，但会改变演示数据的输出口径，故未启用。
 CREATE VIEW class_result_distribution AS
 SELECT r.year_id, r.class_id, c.class_name, r.grade, COUNT(*) AS student_count,
        MIN(r.total_score) AS minimum_score, MAX(r.total_score) AS maximum_score,
@@ -953,6 +1035,22 @@ FROM student_progress
 WHERE prev_year_id IS NOT NULL
 GROUP BY year_id, year_name, class_id;
 
+-- 运维监控视图：截止后仍卡住的已提交表单（存在未终审条目，或没有任何条目通过终审），
+-- 供管理员定位需要 abandon_form 处理的学生，避免个别表单卡死整学年公示。
+CREATE VIEW admin_stalled_forms AS
+SELECT f.year_id, f.student_id, s.student_name, a.class_id, f.form_id, f.round_no, f.submitted_at,
+       SUM(i.status NOT IN ('approved','withdrawn')) AS blocking_items,
+       SUM(i.status = 'approved') AS approved_items
+FROM application_form f
+JOIN academic_year y ON y.year_id = f.year_id
+JOIN student s ON s.student_id = f.student_id
+JOIN student_year_assessment a ON a.student_id = f.student_id AND a.year_id = f.year_id
+JOIN application_item i ON i.form_id = f.form_id
+WHERE f.status = 'submitted' AND y.status IN ('open','review')
+  AND UTC_TIMESTAMP() >= y.deadline_at
+GROUP BY f.year_id, f.student_id, s.student_name, a.class_id, f.form_id, f.round_no, f.submitted_at
+HAVING blocking_items > 0 OR approved_items = 0;
+
 CREATE ROLE IF NOT EXISTS 'sa_student', 'sa_reviewer', 'sa_analyst', 'sa_publisher', 'sa_admin';
 GRANT SELECT ON student_assessment.available_projects TO 'sa_student', 'sa_reviewer';
 GRANT SELECT ON student_assessment.published_results TO 'sa_analyst';
@@ -999,6 +1097,9 @@ GRANT SELECT ON student_assessment.project_score TO 'sa_admin';
 GRANT SELECT ON student_assessment.privacy_access_log TO 'sa_admin';
 GRANT EXECUTE ON PROCEDURE student_assessment.abandon_form TO 'sa_admin';
 GRANT EXECUTE ON PROCEDURE student_assessment.publish_year TO 'sa_admin';
+GRANT SELECT ON student_assessment.access_denied_log TO 'sa_admin';
+GRANT SELECT ON student_assessment.admin_operation_log TO 'sa_admin';
+GRANT SELECT ON student_assessment.admin_stalled_forms TO 'sa_admin';
 
 
 -- 已启用学年引用的评分口径保留原版本。变更评分请建立新版本。
@@ -1023,6 +1124,29 @@ BEGIN
     END IF;
     IF OLD.status <> 'draft' AND NEW.status = 'draft' THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '已启用学年不能退回草稿';
+    END IF;
+END$$
+
+-- 学年日期区间互不重叠（MySQL 无跨行约束，用触发器保证）。
+-- 更新仅在日期区间实际变化时检查，并按主键排除自身。
+CREATE TRIGGER check_year_overlap_ins BEFORE INSERT ON academic_year FOR EACH ROW
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM academic_year
+        WHERE NEW.starts_on <= ends_on AND starts_on <= NEW.ends_on
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '学年日期区间不能与已有学年重叠';
+    END IF;
+END$$
+
+CREATE TRIGGER check_year_overlap_upd BEFORE UPDATE ON academic_year FOR EACH ROW
+BEGIN
+    IF (NEW.starts_on <> OLD.starts_on OR NEW.ends_on <> OLD.ends_on) AND EXISTS (
+        SELECT 1 FROM academic_year
+        WHERE year_id <> NEW.year_id
+          AND NEW.starts_on <= ends_on AND starts_on <= NEW.ends_on
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '学年日期区间不能与已有学年重叠';
     END IF;
 END$$
 
@@ -1110,6 +1234,11 @@ END$$
 CREATE TRIGGER keep_project_insert BEFORE INSERT ON assessment_project FOR EACH ROW
 BEGIN
     CALL require_unused_rule(NEW.rule_id);
+    -- 编辑期即校验权重合计，避免把"权重和≠1"的问题拖到公示时才暴露
+    IF (SELECT COALESCE(SUM(weight), 0) FROM assessment_project
+        WHERE rule_id = NEW.rule_id) + NEW.weight > 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '同一规则的项目权重合计不能超过 1';
+    END IF;
 END$$
 
 CREATE TRIGGER keep_project_update BEFORE UPDATE ON assessment_project FOR EACH ROW
@@ -1117,6 +1246,10 @@ BEGIN
     CALL require_unused_rule(OLD.rule_id);
     IF OLD.rule_id <> NEW.rule_id THEN
         CALL require_unused_rule(NEW.rule_id);
+    END IF;
+    IF (SELECT COALESCE(SUM(weight), 0) FROM assessment_project
+        WHERE rule_id = NEW.rule_id AND project_id <> OLD.project_id) + NEW.weight > 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '同一规则的项目权重合计不能超过 1';
     END IF;
 END$$
 
@@ -1126,11 +1259,117 @@ BEGIN
 END$$
 DELIMITER ;
 
+-- 主数据与学年状态变更审计（AFTER 单语句触发器，无需切换 DELIMITER）。
+-- operator_login 取执行 SQL 的数据库账号；EVENT 自动推进的学年状态变更
+-- 归属于事件定义者账号（安装账号），见使用说明。审计表刻意不设外键：
+-- 审计写入永远不应因业务数据问题而失败。
+CREATE TRIGGER audit_class_group_ins AFTER INSERT ON class_group FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'class_group:insert', NEW.class_id, NEW.class_name);
+
+CREATE TRIGGER audit_class_group_upd AFTER UPDATE ON class_group FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'class_group:update', NEW.class_id,
+        CONCAT(OLD.class_name, ' -> ', NEW.class_name));
+
+CREATE TRIGGER audit_class_group_del AFTER DELETE ON class_group FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'class_group:delete', OLD.class_id, OLD.class_name);
+
+CREATE TRIGGER audit_student_ins AFTER INSERT ON student FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'student:insert', NEW.student_id,
+        CONCAT('name=', NEW.student_name, ', class=', NEW.class_id, ', login=', NEW.login_name));
+
+CREATE TRIGGER audit_student_upd AFTER UPDATE ON student FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'student:update', NEW.student_id,
+        CONCAT('name:', OLD.student_name, '->', NEW.student_name,
+               ', class:', OLD.class_id, '->', NEW.class_id,
+               ', login:', OLD.login_name, '->', NEW.login_name));
+
+CREATE TRIGGER audit_student_del AFTER DELETE ON student FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'student:delete', OLD.student_id,
+        CONCAT('name=', OLD.student_name, ', login=', OLD.login_name));
+
+CREATE TRIGGER audit_reviewer_ins AFTER INSERT ON reviewer FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'reviewer:insert', NEW.reviewer_id,
+        CONCAT('name=', NEW.reviewer_name, ', role=', NEW.review_role,
+               ', class=', COALESCE(NEW.class_id, 'NULL'), ', login=', NEW.login_name));
+
+CREATE TRIGGER audit_reviewer_upd AFTER UPDATE ON reviewer FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'reviewer:update', NEW.reviewer_id,
+        CONCAT('name:', OLD.reviewer_name, '->', NEW.reviewer_name,
+               ', role:', OLD.review_role, '->', NEW.review_role,
+               ', class:', COALESCE(OLD.class_id, 'NULL'), '->', COALESCE(NEW.class_id, 'NULL'),
+               ', login:', OLD.login_name, '->', NEW.login_name));
+
+CREATE TRIGGER audit_reviewer_del AFTER DELETE ON reviewer FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'reviewer:delete', OLD.reviewer_id,
+        CONCAT('name=', OLD.reviewer_name, ', login=', OLD.login_name));
+
+CREATE TRIGGER audit_rule_ins AFTER INSERT ON assessment_rule FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_rule:insert', NEW.rule_id,
+        CONCAT(NEW.rule_name, ' ', NEW.version_no));
+
+CREATE TRIGGER audit_rule_upd AFTER UPDATE ON assessment_rule FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_rule:update', NEW.rule_id,
+        CONCAT(OLD.rule_name, ' ', OLD.version_no, ' -> ', NEW.rule_name, ' ', NEW.version_no));
+
+CREATE TRIGGER audit_rule_del AFTER DELETE ON assessment_rule FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_rule:delete', OLD.rule_id,
+        CONCAT(OLD.rule_name, ' ', OLD.version_no));
+
+CREATE TRIGGER audit_project_ins AFTER INSERT ON assessment_project FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_project:insert', NEW.project_id,
+        CONCAT('rule=', NEW.rule_id, ', name=', NEW.project_name,
+               ', weight=', NEW.weight, ', cap=', NEW.score_cap));
+
+CREATE TRIGGER audit_project_upd AFTER UPDATE ON assessment_project FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_project:update', NEW.project_id,
+        CONCAT('rule:', OLD.rule_id, '->', NEW.rule_id,
+               ', name:', OLD.project_name, '->', NEW.project_name,
+               ', weight:', OLD.weight, '->', NEW.weight,
+               ', cap:', OLD.score_cap, '->', NEW.score_cap));
+
+CREATE TRIGGER audit_project_del AFTER DELETE ON assessment_project FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'assessment_project:delete', OLD.project_id,
+        CONCAT('rule=', OLD.rule_id, ', name=', OLD.project_name));
+
+CREATE TRIGGER audit_year_ins AFTER INSERT ON academic_year FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'academic_year:insert', NEW.year_id,
+        CONCAT('status=', NEW.status, ', rule=', NEW.rule_id,
+               ', window=', NEW.starts_on, '..', NEW.ends_on));
+
+CREATE TRIGGER audit_year_upd AFTER UPDATE ON academic_year FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'academic_year:update', NEW.year_id,
+        CONCAT('status:', OLD.status, '->', NEW.status,
+               ', deadline:', OLD.deadline_at, '->', NEW.deadline_at,
+               ', rule:', OLD.rule_id, '->', NEW.rule_id));
+
+CREATE TRIGGER audit_year_del AFTER DELETE ON academic_year FOR EACH ROW
+INSERT INTO admin_operation_log(operator_login, action, target_id, detail)
+VALUES (SUBSTRING_INDEX(USER(), '@', 1), 'academic_year:delete', OLD.year_id,
+        CONCAT('status=', OLD.status));
+
 -- 学年状态自动推进（事件调度器）：到开放时刻自动开启，过截止时刻自动转入审核，
 -- 状态机由数据库自己推进，应用层与人工只需负责建学年与公示两个端点。
--- 事件调度器默认关闭，此处开启需 SYSTEM_VARIABLES_ADMIN 权限（安装账号具备）。
+-- 事件调度器默认关闭，此处持久化开启（写入 mysqld-auto.cnf，重启后仍然生效），
+-- 需 SYSTEM_VARIABLES_ADMIN 权限（安装账号具备）；demo.py 另以 --event-scheduler=ON 启动兜底。
 -- 若事件被关闭，学年不会自动切换，可用 03_网页接口.sql 的 web_close_submissions 手工兜底。
-SET GLOBAL event_scheduler = ON;
+SET PERSIST event_scheduler = ON;
 
 CREATE EVENT open_due_years
 ON SCHEDULE EVERY 1 MINUTE
