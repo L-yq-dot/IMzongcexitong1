@@ -24,6 +24,9 @@ DEMO_USERS = {
     "final": ("sa_demo_final", "sa_reviewer"),
     "publisher": ("sa_demo_publisher", "sa_publisher"),
     "analyst": ("sa_demo_analyst", "sa_analyst"),
+    # 管理员仅供 SQL 客户端与测试直连：web_profile 没有管理员绑定，
+    # 故不进入下方网页演示账号列表（DEMO_ACCOUNTS）。
+    "admin": ("sa_demo_admin", "sa_admin"),
     "initial_other": ("sa_demo_initial2", "sa_reviewer"),
     "student_other": ("sa_demo_s002", "sa_student"),
 }
@@ -133,7 +136,9 @@ def start_mysql(runtime, server_bin, client_bin):
     with log_path.open("wb") as log:
         mysql = subprocess.Popen(
             [*flags, "--bind-address=127.0.0.1", f"--port={port}", "--mysqlx=OFF",
-             "--max-allowed-packet=32M", "--innodb-buffer-pool-size=64M"],
+             "--max-allowed-packet=32M", "--innodb-buffer-pool-size=64M",
+             # 学年状态自动推进依赖事件调度器；与 01 的 SET PERSIST 互为兜底
+             "--event-scheduler=ON"],
             cwd=data_dir, stdout=log, stderr=subprocess.STDOUT,
         )
         try:
@@ -160,7 +165,8 @@ def start_mysql(runtime, server_bin, client_bin):
                 "SESSION_COOKIE_SECURE": False,
                 "DEMO_ACCOUNTS": {
                     actor: (username, state["passwords"][actor])
-                    for actor, (username, _) in DEMO_USERS.items() if not actor.endswith("_other")
+                    for actor, (username, _) in DEMO_USERS.items()
+                    if not actor.endswith("_other") and actor != "admin"
                 },
             }
         finally:
