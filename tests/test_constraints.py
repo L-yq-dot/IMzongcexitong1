@@ -2,7 +2,8 @@
 
 覆盖：申报分/终审核定分硬封顶、学年时间锁与防重叠、权重合计、登录名互斥、
 学生自查接口、公示视图、越权留痕、驳回重提 diff、截止作废兜底、事件调度器、
-管理员主数据审计与列级权限。与 test_workflow 共用 demo_database，互不干扰。
+管理员主数据审计与列级权限；v7 增公示校验码、材料查重、规则版本链、状态变更日志。
+与 test_workflow 共用 demo_database，互不干扰。
 
 运行：python -m unittest discover -s tests -v
 """
@@ -231,6 +232,87 @@ class ConstraintAuditTests(unittest.TestCase):
             self.query(self.admin, "SELECT file_body FROM evidence LIMIT 1")
         with self.assertRaises(connector.Error):  # 管理员对业务数据只读
             self.query(self.admin, "INSERT INTO application_form(student_id, year_id) VALUES ('S001', %s)", (YEAR,))
+
+    # v7：15-18 依赖前序结果——15 用已公示的 HISTORY；16 撤回再提交甲的 YEAR 表单；
+    # 18 的状态序列由 02/12/16 共同构成，故按编号顺序执行。
+
+    def test_15_publication_checksum(self):
+        cols, rows = self.call(self.student, "verify_publication", HISTORY)[0]
+        self.assertEqual(rows[0][4], 1)  # intact：公示数据未被改动
+        stored = rows[0][2]
+        # 绕过应用层直接篡改某学生总分，重算摘要立刻与落盘校验码不一致
+        self.query(self.root, "UPDATE assessment_result SET total_score = total_score + 1 "
+                              "WHERE student_id = 'S001' AND year_id = %s", (HISTORY,))
+        self.assertEqual(self.call(self.student, "verify_publication", HISTORY)[0][1][0][4], 0)
+        self.query(self.root, "UPDATE assessment_result SET total_score = total_score - 1 "
+                              "WHERE student_id = 'S001' AND year_id = %s", (HISTORY,))
+        rows = self.call(self.student, "verify_publication", HISTORY)[0][1]
+        self.assertEqual(rows[0][4], 1)
+        self.assertEqual(rows[0][2], stored)  # 校验码落盘后不可变
+        with self.assertRaises(connector.Error) as ctx:
+            self.call(self.student, "verify_publication", YEAR)  # 尚未公示
+        self.assertIn("该学年尚未公示", str(ctx.exception))
+        with self.assertRaises(connector.Error) as ctx:
+            self.call(self.student, "verify_publication", "9999-9999")
+        self.assertIn("学年不存在", str(ctx.exception))
+
+    def test_16_evidence_duplicates(self):
+        items = self.query(self.root,
+                           "SELECT i.item_id FROM application_item i JOIN application_form f USING (form_id) "
+                           "WHERE f.student_id = 'S001' AND f.year_id = %s ORDER BY i.item_id", (YEAR,))
+        i1, i2 = items[0][0], items[1][0]
+        # 撤回甲的表单，给第二条追加一份与第一条同内容（proof-a）的附件，再提交
+        self.call(self.student, "reopen_form", YEAR)
+        self.call(self.student, "add_evidence", YEAR, i2, "证明甲副本.txt", b"proof-a")
+        self.call(self.student, "submit_form", YEAR)
+        cols, rows = self.call(self.initial, "check_evidence_duplicates", i1)[0]
+        self.assertEqual(len(rows), 1)
+        row = dict(zip(cols, rows[0]))
+        self.assertEqual(row["file_name"], "证明甲.txt")
+        self.assertEqual(int(row["active_copies"]), 2)          # 全库同内容活跃附件 2 份
+        self.assertEqual(int(row["copies_on_other_items"]), 1)  # 其中 1 份在别的条目上
+        self.assertNotIn("student_id", cols)                    # 只给计数，不暴露他人身份
+        dup = self.query(self.admin, "SELECT total_copies, active_copies, distinct_items FROM evidence_duplicates")
+        self.assertEqual(len(dup), 1)
+        self.assertEqual([int(v) for v in dup[0]], [2, 2, 2])
+        with self.assertRaises(connector.Error):  # 学生无审核查重权限
+            self.call(self.student, "check_evidence_duplicates", i1)
+
+    def test_17_rule_version_chain(self):
+        chain = self.query(self.admin, "SELECT rule_id, root_rule_id, depth, version_path "
+                                       "FROM rule_version_chain ORDER BY rule_id")
+        self.assertEqual(chain, [(1, 1, 1, "1"), (2, 2, 1, "2")])  # 规则 1/2 均为首版
+        self.query(self.root, "INSERT INTO assessment_rule(rule_id, rule_name, version_no, formula_note, effective_on, parent_rule_id) "
+                              "VALUES (4, '信息管理系学生综合测评', '4.0-test', '版本链测试', '2027-09-01', 2)")
+        chain = self.query(self.admin, "SELECT rule_id, root_rule_id, depth, version_path "
+                                       "FROM rule_version_chain ORDER BY rule_id")
+        self.assertEqual(chain, [(1, 1, 1, "1"), (2, 2, 1, "2"), (4, 2, 2, "2->4")])
+        with self.assertRaises(connector.Error) as ctx:  # 自环被 CHECK 拦截
+            self.query(self.root, "INSERT INTO assessment_rule(rule_id, rule_name, version_no, formula_note, effective_on, parent_rule_id) "
+                                  "VALUES (5, '自环规则', '5.0-test', '自环测试', '2027-09-01', 5)")
+        self.assertIn("Check constraint", str(ctx.exception))
+        self.query(self.root, "DELETE FROM assessment_rule WHERE rule_id = 4")
+        self.assertEqual(len(self.query(self.analyst, "SELECT rule_id FROM rule_version_chain")), 2)  # 分析员可读
+
+    def test_18_status_change_log(self):
+        def seq(etype, eid):
+            return self.query(self.admin,
+                              "SELECT old_status, new_status FROM status_change_log "
+                              "WHERE entity_type = %s AND entity_id = %s ORDER BY change_id", (etype, str(eid)))
+        s1form = self.query(self.root, "SELECT form_id FROM application_form WHERE student_id='S001' AND year_id=%s", (YEAR,))[0][0]
+        s2form = self.query(self.root, "SELECT form_id FROM application_form WHERE student_id='S002' AND year_id=%s", (YEAR,))[0][0]
+        # 甲：02 提交，16 撤回再提交；乙：12 提交后作废
+        self.assertEqual(seq("application_form", s1form),
+                         [("draft", "submitted"), ("submitted", "draft"), ("draft", "submitted")])
+        self.assertEqual(seq("application_form", s2form), [("draft", "submitted"), ("submitted", "void")])
+        # 学年：12 快进关闭再恢复；HISTORY 由 02 关闭并公示
+        self.assertEqual(seq("academic_year", YEAR), [("open", "review"), ("review", "open")])
+        self.assertEqual(seq("academic_year", HISTORY), [("open", "review"), ("review", "published")])
+        self.assertTrue(all(r[0] for r in self.query(self.admin, "SELECT changed_by FROM status_change_log")))
+        # 仅状态实际迁移才留痕：不改状态的 UPDATE 不产生新日志
+        before = self.query(self.admin, "SELECT COUNT(*) FROM status_change_log")[0][0]
+        self.query(self.root, "UPDATE application_form SET modified_at = UTC_TIMESTAMP(6) WHERE form_id = %s", (s1form,))
+        self.assertEqual(self.query(self.admin, "SELECT COUNT(*) FROM status_change_log")[0][0], before)
 
 
 if __name__ == "__main__":
