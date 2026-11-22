@@ -109,3 +109,15 @@ FROM public_notice WHERE year_id = '2025-2026' ORDER BY rank_no, student_id;
 -- 管理审计：主数据录入、学年状态推进与公示操作均留痕（展示最近 8 条）。
 SELECT op_id, operator_login, action, target_id, detail, operated_at
 FROM admin_operation_log ORDER BY op_id DESC LIMIT 8;
+
+-- v7 新增展示：公示校验码、规则版本链、材料查重、状态变更日志。
+-- 公示校验码：重算已公示结果的摘要并与落盘校验码比对，intact=1 表示自发布以来未被篡改。
+CALL verify_publication('2025-2026');
+-- 规则版本链：沿 parent_rule_id 递归展开（演示数据规则 1、2 均为首版，深度 1）。
+SELECT rule_id, rule_name, version_no, root_rule_id, depth, version_path
+FROM rule_version_chain ORDER BY rule_id;
+-- 材料查重：内容指纹相同的附件分组（演示数据仅一份附件，此查询为空）。
+SELECT * FROM evidence_duplicates;
+-- 状态变更日志：学年/表单/条目状态迁移的 old→new 全程留痕（展示最近 8 条）。
+SELECT entity_type, entity_id, old_status, new_status, changed_by
+FROM status_change_log ORDER BY change_id DESC LIMIT 8;
