@@ -1,0 +1,52 @@
+{% extends 'base.html' %}
+{% from 'components.html' import badge, blank, hidden %}
+{% block body %}
+<a class="text-link back-link" href="{{ url_for('review', year=item.year_id) }}">← 返回审核队列</a>
+<div class="page-heading"><h1>{{ item.project_name }}</h1><p>条目 #{{ item.item_id }} · {{ item.year_id }} 学年 · 第 {{ item.round_no }} 轮</p></div>
+<div class="workspace-grid">
+  <div class="side-stack">
+    <section class="panel">
+      <div class="section-head"><h2>申报详情</h2>{{ badge(item.status) }}</div>
+      <dl class="fact-grid"><div><dt>申报学生</dt><dd>{{ item.student_name }} · {{ item.student_id }}</dd></div><div><dt>发生日期</dt><dd>{{ item.occurred_on }}</dd></div><div><dt>申报分值</dt><dd>{{ item.claimed_score|number }}</dd></div><div><dt>核定分值</dt><dd>{{ item.final_score|number }}</dd></div></dl>
+      <h3>申报细节</h3><p class="preserve">{{ item.details }}</p>
+      {% if item.notes %}<h3>填报说明</h3><p class="preserve">{{ item.notes }}</p>{% endif %}
+    </section>
+    <section class="panel">
+      <div class="section-head"><div><h2>审核历史</h2><p>包括前序轮次的审核决定。</p></div></div>
+      {% if history %}<ol class="history">{% for row in history %}<li><div><strong>{{ role_names[row.stage] }}</strong> {{ badge(row.decision) }}<small>第 {{ row.round_no }} 轮 · {{ row.reviewed_at|date_cn }}</small>{% if row.opinion %}<p class="preserve">{{ row.opinion }}</p>{% endif %}{% if row.approved_score is not none %}<p>核定 {{ row.approved_score|number }} 分</p>{% endif %}</div></li>{% endfor %}</ol>
+      {% else %}{{ blank('还没有审核记录', '保存决定后将生成第一条记录。') }}{% endif %}
+    </section>
+  </div>
+  <aside class="side-stack">
+    <section class="panel">
+      <div class="section-head"><h2>证明材料</h2></div>
+      {% for file in files %}<div class="material"><strong>{{ file.file_name }}</strong><small>{{ file.uploaded_at|date_cn }}{{ ' · 历史材料' if not file.active }}</small><details><summary>文件摘要</summary><code>{{ file.sha256 }}</code></details><a class="text-link" href="{{ url_for('evidence', evidence_id=file.evidence_id) }}">下载材料 ↓</a></div>{% else %}<p class="muted">该条目无证明材料。</p>{% endfor %}
+    </section>
+    {% if ai %}
+    <section class="panel ai-panel">
+      <div class="section-head"><div><h2>AI 初审草稿</h2><p>仅作参考，最终以审核决定为准。</p></div><span class="tag">{{ '规则' if ai.source == 'rule' else 'AI' }}</span></div>
+      <p>建议分 <strong>{{ ai.suggested_score|number }}</strong> · 置信度 {{ (ai.confidence * 100)|round(0)|int }}% · 模型 {{ ai.model }}</p>
+      <p class="muted">{{ ai.rationale }}</p>
+      {% if ai.subtype or ai.author_rank or ai.award_level %}<p class="muted">识别：{{ ai.subtype or '—' }}{% if ai.author_rank %} · 第 {{ ai.author_rank }}/{{ ai.author_count or '?' }} 作者{% endif %}{% if ai.award_level %} · {{ ai.award_level }}{{ ai.award_rank or '' }}{% endif %}</p>{% endif %}
+      <p class="muted">状态：{{ ai.status }} · 生成于 {{ ai.created_at|date_cn }}</p>
+    </section>
+    {% endif %}
+    {% if actionable %}
+    <section class="panel">
+      <div class="section-head"><h2>生成初审草稿</h2></div>
+      <p class="muted">规则能直接算的会直接算，不确定的交给 AI；人工可采纳或覆盖。</p>
+      <form method="post" action="{{ url_for('review_ai', item_id=item.item_id) }}">{{ hidden(csrf) }}<button class="button secondary fit" type="submit">生成 / 重新生成 AI 初审草稿</button></form>
+    </section>
+    <section class="panel">
+      <div class="section-head"><h2>提交审核决定</h2></div>
+      <form method="post" class="fields">
+        {{ hidden(csrf) }}
+        <label>审核意见<textarea name="opinion" rows="3" maxlength="2000" placeholder="驳回时须说明补正要求"></textarea></label>
+        {% if account.actor == 'final' %}<label>终审核定分<input type="number" name="score" min="0" max="{{ item.claimed_score }}" step=".01" value="{{ ai.suggested_score if ai else '' }}" placeholder="通过时必填"></label>{% endif %}
+        <div class="actions"><button type="submit" class="button primary" name="decision" value="pass">审核通过</button><button type="submit" class="button secondary" name="decision" value="return">驳回</button></div>
+      </form>
+    </section>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}
