@@ -13,6 +13,8 @@ from flask import (Flask, abort, flash, g, redirect, render_template, request,
                    send_file, session, url_for)
 from mysql import connector
 
+import scoring
+
 
 ROLE_NAMES = {
     "student": "学生", "initial": "班级初审", "counselor": "辅导员复审",
@@ -30,7 +32,8 @@ OPERATIONS = {
     "save_form", "reopen_form", "save_item", "withdraw_item", "add_evidence", "remove_evidence",
     "submit_form", "my_form_status", "my_result", "review_queue", "read_review_item",
     "read_evidence", "review_item", "publish_year", "web_profile", "web_draft",
-    "web_close_submissions",
+    "web_close_submissions", "web_projects", "web_base_scores", "set_base_assessment",
+    "web_ai_context", "web_ai_draft", "web_save_ai_draft",
 }
 SESSION_SECONDS = 8 * 60 * 60
 MAX_EVIDENCE = 5 * 1024 * 1024
@@ -295,8 +298,7 @@ def create_app(config=None):
         if year:
             form_rows, items = call("my_form_status", year["year_id"])
             form = form_rows[0] if form_rows else None
-            projects = query("SELECT * FROM available_projects WHERE year_id = %s ORDER BY project_id",
-                             year["year_id"])
+            projects = call("web_projects", year["year_id"])[0]
             if form and form["status"] == "draft":
                 notes, draft_items, materials = call("web_draft", year["year_id"])
                 form["notes"] = notes[0]["notes"] if notes else ""
@@ -414,7 +416,9 @@ def create_app(config=None):
         if not rows:
             abort(404)
         item = rows[0]
+        ai_rows = call("web_ai_draft", item_id)[0]
         return render_template("review_detail.html", title="申报审核", item=item, files=files, history=history,
+                               ai=ai_rows[0] if ai_rows else None,
                                actionable=item["status"] == g.account.actor + "_pending")
 
     @app.post("/review/<int:item_id>")
@@ -490,6 +494,60 @@ def create_app(config=None):
             stats = query("SELECT * FROM project_submission_statistics WHERE year_id = %s ORDER BY project_id", key)
         return render_template("analytics.html", title="测评统计", years=years, year=year, ranking=ranking,
                                distribution=distribution, stats=stats, classes=classes, class_id=class_id)
+
+    @app.post("/review/<int:item_id>/ai")
+    @require(*REVIEWERS)
+    def review_ai(item_id):
+        try:
+            context_rows = call("web_ai_context", item_id)[0]
+            if not context_rows:
+                abort(404)
+            draft = scoring.generate(context_rows[0])
+            extracted = draft.get("extracted", {})
+            call("web_save_ai_draft", item_id, draft["source"], draft["model"], draft["prompt_version"],
+                 draft.get("rule_key"), extracted.get("subtype"), extracted.get("author_rank"),
+                 extracted.get("author_count"), extracted.get("team_size"), extracted.get("award_level"),
+                 extracted.get("award_rank"), extracted.get("hours"), draft["suggested_score"],
+                 draft["confidence"], draft["rationale"], draft.get("raw"))
+            flash("AI 初审草稿已生成，仅供审核参考。", "success")
+        except scoring.AIError as error:
+            flash(f"AI 初审暂不可用：{error}", "error")
+        except ValueError as error:
+            flash(str(error), "error")
+        except connector.Error as error:
+            flash(handle_db_error(error), "error")
+        return redirect(url_for("review_detail", item_id=item_id), code=303)
+
+    @app.get("/review/base")
+    @require("initial")
+    def base_scores():
+        years, year = choose_year()
+        rows = call("web_base_scores", year["year_id"])[0] if year else []
+        return render_template("base_scores.html", title="基础分录入", years=years, year=year, rows=rows)
+
+    @app.post("/review/base")
+    @require("initial")
+    def base_scores_save():
+        year = form_year()
+        rows = call("web_base_scores", year)[0]
+        saved = 0
+        try:
+            for row in rows:
+                student_id = row["student_id"]
+                a = request.form.get(f"a_{student_id}", "").strip()
+                b1 = request.form.get(f"b1_{student_id}", "").strip()
+                if not a or not b1:
+                    continue
+                call("set_base_assessment", year, student_id, a, b1,
+                     request.form.get(f"a_failed_{student_id}") == "yes",
+                     request.form.get(f"academic_failed_{student_id}") == "yes")
+                saved += 1
+            flash(f"已保存 {saved} 名学生的 A/B1 基础分。", "success")
+        except ValueError as error:
+            flash(str(error), "error")
+        except connector.Error as error:
+            flash(handle_db_error(error), "error")
+        return redirect(url_for("base_scores", year=year), code=303)
 
     return app
 

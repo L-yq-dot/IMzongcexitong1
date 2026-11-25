@@ -21,7 +21,8 @@
       <a class="{{ 'current' if request.endpoint == 'student_workspace' }}" href="{{ url_for('student_workspace') }}"><span aria-hidden="true">▤</span>我的申报</a>
       <a class="{{ 'current' if request.endpoint == 'student_results' }}" href="{{ url_for('student_results') }}"><span aria-hidden="true">◈</span>测评结果</a>
       {% elif account.actor in review_roles %}
-      <a class="current" href="{{ url_for('review') }}"><span aria-hidden="true">✓</span>审核工作台</a>
+      <a class="{{ 'current' if request.endpoint == 'review' }}" href="{{ url_for('review') }}"><span aria-hidden="true">✓</span>审核工作台</a>
+      {% if account.actor == 'initial' %}<a class="{{ 'current' if request.endpoint == 'base_scores' }}" href="{{ url_for('base_scores') }}"><span aria-hidden="true">▤</span>基础分录入</a>{% endif %}
       {% elif account.actor == 'publisher' %}
       <a class="current" href="{{ url_for('publication') }}"><span aria-hidden="true">◈</span>结果公示</a>
       {% else %}

@@ -90,10 +90,10 @@
   </section>
   <aside class="side-stack">
     <section class="panel">
-      <div class="section-head"><div><h2>测评项目</h2><p>本学年评分权重和材料要求</p></div></div>
+      <div class="section-head"><div><h2>加分项目</h2><p>B2 学术科研 / C 实践能力，单项上限与材料要求</p></div></div>
       <ul class="project-list">
       {% for p in projects %}
-        <li><div><strong>{{ p.project_name }}</strong><small>{{ p.evidence_requirement if p.evidence_required else '材料可选' }} · 上限 {{ p.score_cap | number }}</small></div><span>{{ (p.weight * 100) | round(2) | float }}%</span></li>
+        <li><div><strong>{{ p.project_name }}</strong><small>{{ p.evidence_requirement if p.evidence_required else '材料可选' }} · 单项上限 {{ p.score_cap | number }}</small></div><span>{{ '学术科研' if p.component == 'B2' else '实践能力' }}</span></li>
       {% else %}<li class="muted">暂无项目</li>{% endfor %}
       </ul>
     </section>

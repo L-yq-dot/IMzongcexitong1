@@ -38,12 +38,11 @@ END$$
 
 CREATE PROCEDURE web_close_submissions(IN p_year VARCHAR(24))
 BEGIN
-    DECLARE v_rule INT UNSIGNED;
     DECLARE v_status VARCHAR(16);
     DECLARE v_opens, v_deadline DATETIME;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
     START TRANSACTION;
-    CALL lock_assessment_year(p_year, v_rule, v_status, v_opens, v_deadline);
+    CALL lock_assessment_year(p_year, v_status, v_opens, v_deadline);
     IF v_status <> 'open' OR UTC_TIMESTAMP() <= v_opens THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只有已经开放的学年可结束申报';
     END IF;

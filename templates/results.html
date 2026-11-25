@@ -3,11 +3,11 @@
 {% block body %}
 <div class="page-heading"><h1>测评结果</h1><p>{{ year.year_name if year else '暂无测评学年' }}{% if result %} · 公示于 {{ result.generated_at | date_cn }}{% endif %}</p></div>
 {% if result %}
-<section class="hero result-hero"><div class="hero-copy"><p class="hero-label">综合测评总分</p><div class="score">{{ result.total_score|number }} <span>/ 100</span></div><p>{{ result.grade }} · 学年第 {{ result.rank_no }} 名</p></div><div class="hero-art" aria-hidden="true"><i></i><i></i><i></i><span>+</span></div></section>
+<section class="hero result-hero"><div class="hero-copy"><p class="hero-label">综合素质测评总分</p><div class="score">{{ result.total_score|number }} <span>/ 100+</span></div><p>{{ result.grade }} · 年级第 {{ result.rank_no }} 名</p></div><div class="hero-art" aria-hidden="true"><i></i><i></i><i></i><span>+</span></div></section>
 <section class="panel after-hero">
-  <div class="section-head"><div><h2>分项得分</h2><p>总分由各项目贡献分相加得出。</p></div>{{ badge('published') }}</div>
-  <div class="table-scroll"><table><thead><tr><th>测评项目</th><th>原始分</th><th>项目核定分</th><th>贡献分</th></tr></thead><tbody>
-  {% for row in scores %}<tr><td><strong>{{ row.project_name }}</strong></td><td>{{ row.raw_score|number }}</td><td>{{ row.approved_score|number }}</td><td>{{ row.weighted_score|number }}</td></tr>{% endfor %}
+  <div class="section-head"><div><h2>分项得分</h2><p>总分 = 基本素质 A + 学业成绩 B1 + 学术科研 B2 + 实践能力 C。</p></div>{{ badge('published') }}</div>
+  <div class="table-scroll"><table><thead><tr><th>分项</th><th>得分</th></tr></thead><tbody>
+  {% for row in scores %}<tr><td><strong>{{ row.component_name }}</strong></td><td>{{ row.score|number }}</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 {% else %}
