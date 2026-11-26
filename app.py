@@ -26,7 +26,7 @@ STATUSES = {
     "draft": "草稿", "submitted": "已提交", "completed": "已完成",
     "initial_pending": "待初审", "counselor_pending": "待复审",
     "final_pending": "待终审", "returned": "已驳回", "approved": "终审通过",
-    "withdrawn": "已撤销", "pass": "通过", "return": "驳回", "empty": "未建档",
+    "withdrawn": "已撤销", "void": "已作废", "pass": "通过", "return": "驳回", "empty": "未建档",
 }
 OPERATIONS = {
     "save_form", "reopen_form", "save_item", "withdraw_item", "add_evidence", "remove_evidence",
@@ -53,7 +53,7 @@ class Account:
 def create_app(config=None):
     app = Flask(__name__)
     app.config.update(
-        SECRET_KEY=secrets.token_hex(32),
+        SECRET_KEY=os.getenv("SA_SECRET_KEY") or secrets.token_hex(32),
         MYSQL_HOST=os.getenv("SA_MYSQL_HOST", "127.0.0.1"),
         MYSQL_PORT=int(os.getenv("SA_MYSQL_PORT", "3306")),
         MYSQL_TLS_CA=os.getenv("SA_MYSQL_TLS_CA"),
@@ -206,7 +206,8 @@ def create_app(config=None):
         return render_template("error.html", title="暂时无法打开", message=messages[error.code]), error.code
 
     def verify_login(username, password):
-        with connect(username, password) as connection:
+        connection = connect(username, password)
+        try:
             active = execute(connection, "SELECT CURRENT_ROLE() AS active")[0][0]["active"]
             roles = set(re.findall(r"`(sa_[a-z]+)`@", active))
             profile = []
@@ -223,7 +224,9 @@ def create_app(config=None):
                 if f"sa_{actor}" in roles:
                     return Account(username, password, actor, ROLE_NAMES[actor], username,
                                    None, monotonic() + SESSION_SECONDS)
-        return None
+            return None
+        finally:
+            connection.close()
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
