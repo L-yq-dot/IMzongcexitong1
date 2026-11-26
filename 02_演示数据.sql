@@ -1,8 +1,8 @@
 -- 可选，只在刚创建的空库中运行一次。用有建档权限的安装账号执行。
 -- 全部姓名、学号和材料均为虚构。账号名仅写入业务绑定表。
--- 真实口径演示：S = A(20) + B1(80) + B2(加分) + C(加分)；
+-- 真实口径演示：S = A + B1 + B2(加分) + C(加分)；A/B1 满分由规则 a_cap/b1_cap 决定（演示规则取 20/80）；
 -- 24级及以前 B1=平均绩点×20，25级及以后 B1=加权平均分×0.8；
--- 优秀比例按年级 20%，结果只有优秀/合格/不合格。
+-- 优秀比例按年级 20%，结果只有优秀/合格/不合格（不合格学生不占优秀名额）。
 USE student_assessment;
 SET @demo_operator = SUBSTRING_INDEX(USER(), '@', 1);
 
@@ -32,25 +32,29 @@ VALUES
     (2,'信息管理系学生素质综合测评（25级及以后）','2026.1','ge2025','weighted_x08',0.20,20,80,
      'S=A+B1+B2+C；B1=测评学年课程加权平均分×0.8；优秀不超过年级20%','2026-05-29');
 
+-- component 与 category 均为 VIRTUAL 生成列（由 rule_key 派生）：
+--   component：paper/book/project/competition/ip→B2，social_work/volunteer/practice→C；
+--   category ：B2→学术科研，C→实践能力。
+-- 故 INSERT 不写 component/category，只写 rule_key。
 INSERT INTO assessment_project
-    (project_id, rule_id, component, rule_key, project_name, category, score_cap, total_cap, max_items, evidence_required, evidence_requirement)
+    (project_id, rule_id, rule_key, project_name, score_cap, total_cap, max_items, evidence_required, evidence_requirement)
 VALUES
-    (101,1,'B2','paper','学术论文','学术科研',6,NULL,NULL,TRUE,'论文全文或录用证明'),
-    (102,1,'B2','book','学术著作','学术科研',10,NULL,NULL,TRUE,'著作封面/出版证明'),
-    (103,1,'B2','project','科研课题','学术科研',3,NULL,NULL,TRUE,'立项/结项证明'),
-    (104,1,'B2','competition','学术竞赛','学术科研',3.5,NULL,2,TRUE,'获奖证书'),
-    (105,1,'B2','ip','知识产权','学术科研',2,NULL,2,TRUE,'授权证书'),
-    (111,1,'C','social_work','社会工作','实践能力',4,NULL,1,TRUE,'任职证明'),
-    (112,1,'C','volunteer','志愿服务','实践能力',1,NULL,1,TRUE,'志愿时长证明'),
-    (113,1,'C','practice','实践活动','实践能力',1,NULL,7,TRUE,'获奖/参与证明'),
-    (201,2,'B2','paper','学术论文','学术科研',6,NULL,NULL,TRUE,'论文全文或录用证明'),
-    (202,2,'B2','book','学术著作','学术科研',10,NULL,NULL,TRUE,'著作封面/出版证明'),
-    (203,2,'B2','project','科研课题','学术科研',3,NULL,NULL,TRUE,'立项/结项证明'),
-    (204,2,'B2','competition','学术竞赛','学术科研',3.5,NULL,2,TRUE,'获奖证书'),
-    (205,2,'B2','ip','知识产权','学术科研',2,NULL,2,TRUE,'授权证书'),
-    (211,2,'C','social_work','社会工作','实践能力',4,NULL,1,TRUE,'任职证明'),
-    (212,2,'C','volunteer','志愿服务','实践能力',1,NULL,1,TRUE,'志愿时长证明'),
-    (213,2,'C','practice','实践活动','实践能力',1,NULL,7,TRUE,'获奖/参与证明');
+    (101,1,'paper','学术论文',6,NULL,NULL,TRUE,'论文全文或录用证明'),
+    (102,1,'book','学术著作',10,NULL,NULL,TRUE,'著作封面/出版证明'),
+    (103,1,'project','科研课题',3,NULL,NULL,TRUE,'立项/结项证明'),
+    (104,1,'competition','学术竞赛',3.5,NULL,2,TRUE,'获奖证书'),
+    (105,1,'ip','知识产权',2,NULL,2,TRUE,'授权证书'),
+    (111,1,'social_work','社会工作',4,NULL,1,TRUE,'任职证明'),
+    (112,1,'volunteer','志愿服务',1,NULL,1,TRUE,'志愿时长证明'),
+    (113,1,'practice','实践活动',1,NULL,7,TRUE,'获奖/参与证明'),
+    (201,2,'paper','学术论文',6,NULL,NULL,TRUE,'论文全文或录用证明'),
+    (202,2,'book','学术著作',10,NULL,NULL,TRUE,'著作封面/出版证明'),
+    (203,2,'project','科研课题',3,NULL,NULL,TRUE,'立项/结项证明'),
+    (204,2,'competition','学术竞赛',3.5,NULL,2,TRUE,'获奖证书'),
+    (205,2,'ip','知识产权',2,NULL,2,TRUE,'授权证书'),
+    (211,2,'social_work','社会工作',4,NULL,1,TRUE,'任职证明'),
+    (212,2,'volunteer','志愿服务',1,NULL,1,TRUE,'志愿时长证明'),
+    (213,2,'practice','实践活动',1,NULL,7,TRUE,'获奖/参与证明');
 
 INSERT INTO academic_year(year_id, year_name, starts_on, ends_on, opens_at, deadline_at, status) VALUES
     ('2025-2026','2025–2026 学年','2025-09-01','2026-08-31',
@@ -109,7 +113,8 @@ UPDATE reviewer SET login_name = 'sa_demo_final' WHERE reviewer_id = 4;
 UPDATE academic_year SET status = 'review', deadline_at = UTC_TIMESTAMP() WHERE year_id = '2025-2026';
 CALL publish_year('2025-2026');
 
-SELECT year_id, student_id, grade_year, total_score, grade, rank_no
+-- 匿名公示口径（published_results 不含学号/姓名，供分析员统计）：实名公示见下方 public_notice。
+SELECT year_id, grade_year, class_id, total_score, grade, rank_no
 FROM published_results WHERE year_id = '2025-2026'
 ORDER BY grade_year DESC, rank_no;
 
@@ -119,14 +124,17 @@ JOIN academic_year y USING (year_id)
 WHERE y.year_id = '2025-2026'
 ORDER BY r.student_id, FIELD(cs.component, 'A','B1','B2','C');
 
+-- 学生可见的实名公示（含姓名学号，仅授权 sa_student / sa_analyst）。
 SELECT student_id, student_name, class_id, total_score, grade, rank_no
 FROM public_notice WHERE year_id = '2025-2026' ORDER BY rank_no, student_id;
 
+-- 提交留痕：条目数由快照子表 COUNT 得出（submission_log 不再冗余 item_count）。
 SELECT sl.submission_id, sl.form_id, sl.round_no, sl.submitted_at,
        (SELECT COUNT(*) FROM submission_snapshot_item si
         WHERE si.submission_id = sl.submission_id) AS item_count
 FROM submission_log sl ORDER BY sl.submission_id;
 
+-- 公示校验码：重算已公示结果摘要并与落盘校验码比对，intact=1 表示自发布以来未被篡改。
 CALL verify_publication('2025-2026');
 SELECT rule_id, rule_name, version_no, root_rule_id, depth, version_path
 FROM rule_version_chain ORDER BY rule_id;
